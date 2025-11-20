@@ -589,6 +589,10 @@ def symmetric_inference(model, img1, img2, device):
         with torch.cuda.amp.autocast(enabled=False):
             res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1)
             res2 = model._downstream_head(2, [tok.float() for tok in dec2], shape2)
+            if 'means' in res1:
+                res1['pts3d'] = res1['means']
+            if 'means' in res2:
+                res2['pts3d'] = res2['means']
         return res1, res2
 
     # decoder 1-2
