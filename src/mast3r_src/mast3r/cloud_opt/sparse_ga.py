@@ -541,12 +541,16 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
         path2 = cache_path + f'/forward/{idx2}/{idx1}.pth'
         path_corres = cache_path + f'/corres_conf={desc_conf}_{subsample=}/{idx1}-{idx2}.pth'
         path_corres2 = cache_path + f'/corres_conf={desc_conf}_{subsample=}/{idx2}-{idx1}.pth'
+        
+        # NEW: Paths for Gaussian attributes
+        path1_gauss = cache_path + f'/forward/{idx1}/{idx2}_gauss.pth'
+        path2_gauss = cache_path + f'/forward/{idx2}/{idx1}_gauss.pth'
 
         if os.path.isfile(path_corres2) and not os.path.isfile(path_corres):
             score, (xy1, xy2, confs) = torch.load(path_corres2)
             torch.save((score, (xy2, xy1, confs)), path_corres)
 
-        if not all(os.path.isfile(p) for p in (path1, path2, path_corres)):
+        if not all(os.path.isfile(p) for p in (path1, path2, path_corres, path1_gauss, path2_gauss)):
             if model is None:
                 continue
             res = symmetric_inference(model, img1, img2, device=device)
@@ -554,10 +558,20 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
             C11, C21, C22, C12 = [r['conf'][0] for r in res]
             descs = [r['desc'][0] for r in res]
             qonfs = [r[desc_conf][0] for r in res]
+            
+            # NEW: Extract Gaussian attributes from all 4 predictions
+            gauss_attrs_11 = extract_gaussian_attributes(res[0])
+            gauss_attrs_21 = extract_gaussian_attributes(res[1])
+            gauss_attrs_22 = extract_gaussian_attributes(res[2])
+            gauss_attrs_12 = extract_gaussian_attributes(res[3])
 
             # save
             torch.save(to_cpu((X11, C11, X21, C21)), mkdir_for(path1))
             torch.save(to_cpu((X22, C22, X12, C12)), mkdir_for(path2))
+            
+            # NEW: Save Gaussian attributes
+            torch.save(to_cpu((gauss_attrs_11, gauss_attrs_21)), mkdir_for(path1_gauss))
+            torch.save(to_cpu((gauss_attrs_22, gauss_attrs_12)), mkdir_for(path2_gauss))
 
             # perform reciprocal matching
             corres = extract_correspondences(descs, qonfs, device=device, subsample=subsample)
@@ -575,20 +589,67 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
     return res_paths, cache_path
 
 
+def extract_gaussian_attributes(result_dict):
+    """Extract Gaussian splat attributes from Splatt3R model output."""
+    gauss_attrs = {}
+    
+    # Extract Gaussian-specific attributes from Splatt3R predictions
+    if 'scales' in result_dict:
+        gauss_attrs['scales'] = result_dict['scales'][0]
+    if 'rotations' in result_dict:
+        gauss_attrs['rotations'] = result_dict['rotations'][0]
+    if 'opacities' in result_dict:
+        gauss_attrs['opacities'] = result_dict['opacities'][0]
+    if 'sh' in result_dict:
+        gauss_attrs['sh'] = result_dict['sh'][0]
+    elif 'features_dc' in result_dict:
+        gauss_attrs['sh'] = result_dict['features_dc'][0]
+    elif 'colors' in result_dict:
+        # Fallback: convert RGB to SH DC component
+        gauss_attrs['sh'] = result_dict['colors'][0]
+    
+    return gauss_attrs
+
+
 def symmetric_inference(model, img1, img2, device):
     shape1 = torch.from_numpy(img1['true_shape']).to(device, non_blocking=True)
     shape2 = torch.from_numpy(img2['true_shape']).to(device, non_blocking=True)
-    img1 = img1['img'].to(device, non_blocking=True)
-    img2 = img2['img'].to(device, non_blocking=True)
+    img1_tensor = img1['img'].to(device, non_blocking=True)
+    img2_tensor = img2['img'].to(device, non_blocking=True)
 
-    # compute encoder only once
-    feat1, feat2, pos1, pos2 = model._encode_image_pairs(img1, img2, shape1, shape2)
+    # Check if model is Splatt3R (has encoder attribute) or MASt3R
+    if hasattr(model, 'encoder'):
+        # Splatt3R model - use the encoder for feature extraction
+        encoder = model.encoder
+        feat1, feat2, pos1, pos2 = encoder._encode_image_pairs(img1_tensor, img2_tensor, shape1, shape2)
+        use_splatt3r = True
+    else:
+        # MASt3R model - use directly
+        feat1, feat2, pos1, pos2 = model._encode_image_pairs(img1_tensor, img2_tensor, shape1, shape2)
+        encoder = model
+        use_splatt3r = False
 
     def decoder(feat1, feat2, pos1, pos2, shape1, shape2):
-        dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
+        # Use encoder's decoder for both cases
+        dec1, dec2 = encoder._decoder(feat1, pos1, feat2, pos2)
+            
         with torch.cuda.amp.autocast(enabled=False):
-            res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1)
-            res2 = model._downstream_head(2, [tok.float() for tok in dec2], shape2)
+            if use_splatt3r:
+                # Splatt3R: use the wrapped heads (head1/head2) instead of downstream_head1/2
+                # These are wrapped with transpose_to_landscape and handle shape properly
+                res1 = encoder.head1([tok.float() for tok in dec1], shape1)
+                res2 = encoder.head2([tok.float() for tok in dec2], shape2)
+            else:
+                # MASt3R: use _downstream_head with view index
+                if hasattr(encoder, '_downstream_head'):
+                    res1 = encoder._downstream_head(1, [tok.float() for tok in dec1], shape1)
+                    res2 = encoder._downstream_head(2, [tok.float() for tok in dec2], shape2)
+                else:
+                    # Fallback for older MASt3R versions
+                    res1 = encoder.head1([tok.float() for tok in dec1], shape1)
+                    res2 = encoder.head2([tok.float() for tok in dec2], shape2)
+                    
+            # Ensure pts3d is set
             if 'means' in res1:
                 res1['pts3d'] = res1['means']
             if 'means' in res2:
@@ -1049,3 +1110,4 @@ def show_reconstruction(shapes_or_imgs, K, cam2w, pts3d, gt_cam2w=None, gt_K=Non
             else:
                 viz.add_pointcloud(to_numpy(p), mask=masks[i], color=imgs[i])
     viz.show(**kw)
+

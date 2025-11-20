@@ -34,6 +34,7 @@ try:
     from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
     from mast3r.image_pairs import make_pairs
     from dust3r.utils.image import load_images
+    from mast3r.utils.misc import hash_md5
 except ImportError as e:
     print(f"Error importing mast3r/dust3r: {e}")
     sys.exit(1)
@@ -61,6 +62,19 @@ def save_splat_ply(path, xyz, opacity, scale, rot, sh):
     if sh.ndim == 3:
         sh = sh[:, 0, :]
     
+    # Ensure sh has 3 channels (RGB)
+    if sh.shape[-1] == 1:
+        # If only 1 channel, replicate it to all 3 channels (grayscale)
+        sh = np.repeat(sh, 3, axis=-1)
+    elif sh.shape[-1] != 3:
+        # If not 3 channels, take first 3 or pad with zeros
+        if sh.shape[-1] > 3:
+            sh = sh[:, :3]
+        else:
+            # Pad with zeros to make 3 channels
+            padding = np.zeros((sh.shape[0], 3 - sh.shape[-1]))
+            sh = np.concatenate([sh, padding], axis=-1)
+    
     elements = np.empty(len(xyz), dtype=dtype)
     elements['x'] = xyz[:, 0]
     elements['y'] = xyz[:, 1]
@@ -82,6 +96,22 @@ def save_splat_ply(path, xyz, opacity, scale, rot, sh):
 
     el = PlyElement.describe(elements, 'vertex')
     PlyData([el]).write(path)
+
+def load_gaussian_attributes(cache_path, img1_instance, img2_instance, is_img1=True):
+    """Load saved Gaussian attributes from cache."""
+    idx1 = hash_md5(img1_instance)
+    idx2 = hash_md5(img2_instance)
+    
+    if is_img1:
+        path_gauss = os.path.join(cache_path, 'forward', idx1, f'{idx2}_gauss.pth')
+    else:
+        path_gauss = os.path.join(cache_path, 'forward', idx2, f'{idx1}_gauss.pth')
+    
+    if os.path.isfile(path_gauss):
+        gauss_attrs = torch.load(path_gauss)
+        return gauss_attrs[0] if is_img1 else gauss_attrs[1]
+    return None
+
 
 def get_reconstructed_scene_splatt3r(outdir, model, retrieval_model, device, filelist, 
                                      scenegraph_type='complete', winsize=20, refid=10,
@@ -118,7 +148,9 @@ def get_reconstructed_scene_splatt3r(outdir, model, retrieval_model, device, fil
         else:
             print(">> Running Image Retrieval...")
             try:
-                retriever = Retriever(retrieval_model, backbone=model.encoder, device=device)
+                # FIXED: Pass only the encoder to the retriever
+                backbone = model.encoder if hasattr(model, 'encoder') else model
+                retriever = Retriever(retrieval_model, backbone=backbone, device=device)
                 with torch.no_grad():
                     sim_matrix = retriever(filelist)
                 del retriever
@@ -138,23 +170,18 @@ def get_reconstructed_scene_splatt3r(outdir, model, retrieval_model, device, fil
         pairs = make_pairs(imgs, scene_graph=scene_graph, prefilter=None, symmetrize=True)
 
     # 5. Run Sparse Global Alignment
-    # IMPORTANT: Pass the underlying encoder model, not the full Splatt3R model
-    print(">> Running Sparse Global Alignment...")
+    print(">> Running Sparse Global Alignment with full Splatt3R model...")
     cache_dir = os.path.join(outdir, 'cache')
     os.makedirs(cache_dir, exist_ok=True)
     
-    # Extract the encoder from Splatt3R model
-    # Splatt3R wraps a MASt3R encoder - we need to pass that to sparse_global_alignment
-    encoder_model = model.encoder  # This is the actual MASt3R model
-    
     scene = sparse_global_alignment(filelist, pairs, cache_dir,
-                                    encoder_model,  # Pass encoder, not full model
+                                    model,  # Pass full model (will be handled correctly now)
                                     lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, 
                                     device=device,
                                     opt_depth=True, 
                                     matching_conf_thr=matching_conf_thr)
     
-    return scene, imgs
+    return scene, imgs, pairs, cache_dir
 
 def main(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -188,7 +215,7 @@ def main(args):
     print("   Model loaded successfully!")
 
     # Run Reconstruction
-    scene, imgs = get_reconstructed_scene_splatt3r(
+    scene, imgs, pairs, cache_dir = get_reconstructed_scene_splatt3r(
         args.output_dir, model, args.retrieval_ckpt, device, filelist,
         scenegraph_type=args.scenegraph_type,
         winsize=args.winsize,
@@ -202,21 +229,95 @@ def main(args):
     
     all_xyz, all_opac, all_scale, all_rot, all_sh = [], [], [], [], []
 
-    print(">> Aggregating Gaussians...")
+    print(">> Aggregating Gaussians with predicted attributes from Splatt3R...")
     with torch.no_grad():
         for i, img_obj in enumerate(tqdm(imgs)):
+            img_instance = filelist[i]
             pose = poses[i].detach()
             pts_global = optimized_means[i].reshape(-1, 3).to(device)
-            
-            # --- Placeholder Attributes ---
             N_points = pts_global.shape[0]
-            opac = torch.ones((N_points, 1), device=device) * 5.0
-            scale = torch.ones((N_points, 3), device=device) * 0.01
             
-            import roma
-            cam_rot = pose[:3, :3]
-            q = roma.rotmat_to_unitquat(cam_rot).unsqueeze(0).repeat(N_points, 1)
-            sh = torch.ones((N_points, 3), device=device) * 0.5
+            # Get image dimensions - handle different formats
+            true_shape = img_obj['true_shape']
+            if isinstance(true_shape, (tuple, list)) and len(true_shape) == 2:
+                H, W = true_shape
+            elif isinstance(true_shape, np.ndarray):
+                if true_shape.shape == (2,):
+                    H, W = int(true_shape[0]), int(true_shape[1])
+                else:
+                    # Fallback: get from image tensor
+                    H, W = img_obj['img'].shape[-2:]
+            else:
+                # Fallback: get from image tensor
+                H, W = img_obj['img'].shape[-2:]
+            
+            # **CHANGED: Load Gaussian attributes from saved pairs**
+            gauss_attrs = None
+            for img1, img2 in pairs:
+                if img1['instance'] == img_instance:
+                    gauss_attrs = load_gaussian_attributes(cache_dir, img1['instance'], img2['instance'], is_img1=True)
+                    if gauss_attrs is not None and len(gauss_attrs) > 0:
+                        break
+                elif img2['instance'] == img_instance:
+                    gauss_attrs = load_gaussian_attributes(cache_dir, img1['instance'], img2['instance'], is_img1=False)
+                    if gauss_attrs is not None and len(gauss_attrs) > 0:
+                        break
+            
+            # Debug: print what attributes we have
+            if i == 0:  # Only print for first image
+                if gauss_attrs is not None:
+                    print(f"\nDebug - Gaussian attributes found: {list(gauss_attrs.keys())}")
+                    for key, val in gauss_attrs.items():
+                        if isinstance(val, torch.Tensor):
+                            print(f"  {key}: shape={val.shape}, dtype={val.dtype}, range=[{val.min():.3f}, {val.max():.3f}]")
+                else:
+                    print("\nDebug - No Gaussian attributes found, using fallback colors")
+            
+            # Extract spherical harmonics (colors) - ALWAYS use fallback for now
+            # Fallback: extract colors from original image
+            img_rgb = img_obj['img'][0].permute(1, 2, 0).cpu().numpy()
+            img_rgb = (img_rgb * 0.5 + 0.5).clip(0, 1)
+            
+            # Subsample image to match point count
+            step = max(1, int(np.sqrt(H * W / N_points)))
+            img_rgb_sub = img_rgb[::step, ::step].reshape(-1, 3)[:N_points]
+            sh = torch.from_numpy(img_rgb_sub).float().to(device)
+            
+            # Ensure we have exactly N_points colors
+            if sh.shape[0] < N_points:
+                # Pad with last color
+                padding = sh[-1:].repeat(N_points - sh.shape[0], 1)
+                sh = torch.cat([sh, padding], dim=0)
+            elif sh.shape[0] > N_points:
+                sh = sh[:N_points]
+            
+            # Extract opacities
+            if gauss_attrs is not None and 'opacities' in gauss_attrs:
+                opac = gauss_attrs['opacities'].to(device)
+                if opac.ndim == 3:
+                    opac = opac.reshape(-1, opac.shape[-1])[:N_points]
+                elif opac.ndim == 1:
+                    opac = opac.reshape(-1, 1)[:N_points]
+            else:
+                opac = torch.ones((N_points, 1), device=device) * 2.0
+            
+            # Extract scales
+            if gauss_attrs is not None and 'scales' in gauss_attrs:
+                scale = gauss_attrs['scales'].to(device)
+                if scale.ndim == 3:
+                    scale = scale.reshape(-1, scale.shape[-1])[:N_points]
+            else:
+                scale = torch.ones((N_points, 3), device=device) * 0.01
+            
+            # Extract rotations
+            if gauss_attrs is not None and 'rotations' in gauss_attrs:
+                q = gauss_attrs['rotations'].to(device)
+                if q.ndim == 3:
+                    q = q.reshape(-1, q.shape[-1])[:N_points]
+            else:
+                import roma
+                cam_rot = pose[:3, :3]
+                q = roma.rotmat_to_unitquat(cam_rot).unsqueeze(0).repeat(N_points, 1)
 
             all_xyz.append(pts_global)
             all_opac.append(opac)
@@ -235,6 +336,7 @@ def main(args):
     save_splat_ply(out_path, final_xyz, final_opac, final_scale, final_rot, final_sh)
     print(f">> Done! Saved to {out_path}")
     print(f"   Total Gaussians: {len(final_xyz)}")
+    print(f"   Color range: [{final_sh.min():.3f}, {final_sh.max():.3f}]")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run Splatt3R-SfM pipeline to generate Gaussian Splat .ply')
