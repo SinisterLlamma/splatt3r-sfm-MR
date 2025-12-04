@@ -225,7 +225,7 @@ def main(args):
     # Extract & Save Splats
     print(">> Extracting optimized geometry...")
     poses = scene.get_im_poses()
-    optimized_means, _, _ = scene.get_dense_pts3d()
+    optimized_means, _, confidences = scene.get_dense_pts3d()
     
     all_xyz, all_opac, all_scale, all_rot, all_sh = [], [], [], [], []
 
@@ -235,6 +235,7 @@ def main(args):
             img_instance = filelist[i]
             pose = poses[i].detach()
             pts_global = optimized_means[i].reshape(-1, 3).to(device)
+            confs = confidences[i].reshape(-1).to(device)
             N_points = pts_global.shape[0]
             
             # Get image dimensions - handle different formats
@@ -342,6 +343,15 @@ def main(args):
                 cam_rot = pose[:3, :3]
                 q = roma.rotmat_to_unitquat(cam_rot).unsqueeze(0).repeat(N_points, 1)
 
+            # FILTERING
+            if args.conf_thresh > 0:
+                mask = confs > args.conf_thresh
+                pts_global = pts_global[mask]
+                opac = opac[mask]
+                scale = scale[mask]
+                q = q[mask]
+                sh = sh[mask]
+
             all_xyz.append(pts_global)
             all_opac.append(opac)
             all_scale.append(scale)
@@ -372,6 +382,7 @@ if __name__ == '__main__':
                         help='Scene graph type')
     parser.add_argument('--winsize', type=int, default=20, help='Retrieval: Num key images')
     parser.add_argument('--refid', type=int, default=10, help='Retrieval: Num neighbors')
+    parser.add_argument('--conf_thresh', type=float, default=0.0, help='Confidence threshold for filtering points')
     
     args = parser.parse_args()
     main(args)
