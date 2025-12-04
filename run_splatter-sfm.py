@@ -273,19 +273,42 @@ def main(args):
                 else:
                     print("\nDebug - No Gaussian attributes found, using fallback colors")
             
-            # Extract spherical harmonics (colors) - ALWAYS use fallback for now
-            # Fallback: extract colors from original image
+            # Extract spherical harmonics (colors)
+            # Fallback/Base: extract colors from original image
             img_rgb = img_obj['img'][0].permute(1, 2, 0).cpu().numpy()
             img_rgb = (img_rgb * 0.5 + 0.5).clip(0, 1)
             
             # Subsample image to match point count
             step = max(1, int(np.sqrt(H * W / N_points)))
             img_rgb_sub = img_rgb[::step, ::step].reshape(-1, 3)[:N_points]
-            sh = torch.from_numpy(img_rgb_sub).float().to(device)
             
-            # Ensure we have exactly N_points colors
+            # Convert base image to SH (DC component)
+            # SH = (RGB - 0.5) / C0
+            C0 = 0.28209479177387814
+            base_sh = (torch.from_numpy(img_rgb_sub).float().to(device) - 0.5) / C0
+
+            if gauss_attrs is not None and 'sh' in gauss_attrs:
+                # The cached SH is a RESIDUAL. We must add the base image SH.
+                sh_residual = gauss_attrs['sh'].to(device)
+                if sh_residual.ndim == 4: # (1, H, W, 3) or similar
+                     sh_residual = sh_residual.reshape(-1, 3)[:N_points]
+                elif sh_residual.ndim == 3:
+                     sh_residual = sh_residual.reshape(-1, 3)[:N_points]
+                
+                # Ensure shapes match before adding
+                if sh_residual.shape[0] > N_points:
+                    sh_residual = sh_residual[:N_points]
+                elif sh_residual.shape[0] < N_points:
+                     padding = sh_residual[-1:].repeat(N_points - sh_residual.shape[0], 1)
+                     sh_residual = torch.cat([sh_residual, padding], dim=0)
+
+                sh = sh_residual + base_sh
+            else:
+                # Use just the base image SH
+                sh = base_sh
+            
+            # Ensure we have exactly N_points colors (for the base_sh path or if shapes mismatched)
             if sh.shape[0] < N_points:
-                # Pad with last color
                 padding = sh[-1:].repeat(N_points - sh.shape[0], 1)
                 sh = torch.cat([sh, padding], dim=0)
             elif sh.shape[0] > N_points:

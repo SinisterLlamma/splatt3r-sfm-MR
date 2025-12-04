@@ -46,6 +46,12 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, ios_mode,
 
 if __name__ == '__main__':
 
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--images', nargs='+', help='Path to input images (1 or 2)')
+    parser.add_argument('--output', default='.', help='Output directory')
+    args, _ = parser.parse_known_args()
+
     image_size = 512
     server_name = '127.0.0.1'
     server_port = None
@@ -57,8 +63,35 @@ if __name__ == '__main__':
     model_name = "brandonsmart/splatt3r_v1.0"
     filename = "epoch=19-step=1200.ckpt"
     weights_path = hf_hub_download(repo_id=model_name, filename=filename)
-    model = main.MAST3RGaussians.load_from_checkpoint(weights_path, device)
+    model = main.MAST3RGaussians.load_from_checkpoint(weights_path, map_location=device)
     chkpt_tag = hash_md5(weights_path)
+
+    if args.images:
+        input_list = args.images
+        # Check if single argument is a directory
+        if len(input_list) == 1 and os.path.isdir(input_list[0]):
+            folder = input_list[0]
+            files = sorted([os.path.join(folder, f) for f in os.listdir(folder) 
+                            if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+            if len(files) > 2:
+                print(f"Warning: Found {len(files)} images in folder. Using the first 2: {files[:2]}")
+                input_list = files[:2]
+            elif len(files) == 0:
+                print(f"Error: No images found in {folder}")
+                sys.exit(1)
+            else:
+                input_list = files
+        
+        print(f"Running in CLI mode on {input_list}")
+        
+        # Ensure output directory exists
+        if args.output and args.output != '.':
+            os.makedirs(args.output, exist_ok=True)
+
+        # CLI Mode: pass ios_mode=False so it treats args.images as a list of paths
+        get_reconstructed_scene(args.output, model, device, silent, image_size, False, input_list)
+        print(f"Saved result to {os.path.join(args.output, 'gaussians.ply')}")
+        sys.exit(0)
 
     # Define example inputs and their corresponding precalculated outputs
     examples = [
