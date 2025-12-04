@@ -156,6 +156,8 @@ def get_reconstructed_scene_splatt3r(outdir, model, retrieval_model, device, fil
                 del retriever
                 torch.cuda.empty_cache()
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"WARNING: Retrieval failed with error: {e}")
                 print(f"Falling back to 'complete' scene graph mode...")
                 scenegraph_type = 'complete'
