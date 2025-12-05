@@ -469,7 +469,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             means = pts3d[i].contiguous().float()
             scales = gauss_attrs[i]['scales'].contiguous().float()
             quats = gauss_attrs[i]['rotations'].contiguous().float()
-            opacities = gauss_attrs[i]['opacities'].contiguous().float()
+            opacities = gauss_attrs[i]['opacities'].contiguous().float().squeeze(-1)
             sh = gauss_attrs[i]['sh'].contiguous().float()
             
             # Normalize quaternions
@@ -489,6 +489,10 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                     # (N, 3) -> (N, 1, 3) -> Degree 0
                     sh = sh.unsqueeze(1)
                     sh_degree = 0
+                elif sh.shape[-1] == 1:
+                     # (N, 1) -> (N, 1, 3) -> Degree 0 (Grayscale to RGB)
+                     sh = sh.repeat(1, 3).unsqueeze(1)
+                     sh_degree = 0
                 elif sh.shape[-1] == 12:
                     # (N, 12) -> (N, 4, 3) -> Degree 1
                     sh = sh.reshape(-1, 4, 3)
@@ -497,6 +501,10 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             elif sh.ndim == 3:
                 # (N, K, 3)
                 K_dim = sh.shape[1]
+                if sh.shape[2] == 1:
+                    # (N, K, 1) -> (N, K, 3)
+                    sh = sh.repeat(1, 1, 3)
+                
                 if K_dim == 1:
                     sh_degree = 0
                 elif K_dim == 4:
@@ -521,10 +529,9 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 packed=True
             )
 
-            # Compute photometric loss (e.g., L1 loss)
-            # Assuming original_img_tensor is [1, 3, H, W] and rendered_image is [H, W, 3]
-            # Convert rendered_image to [1, 3, H, W]
-            rendered_image = rendered_image.permute(2, 0, 1).unsqueeze(0)
+            # rendered_image is (C, H, W, 3) -> (1, H, W, 3)
+            # We want (1, 3, H, W) for loss calculation
+            rendered_image = rendered_image.permute(0, 3, 1, 2)
             
             # Normalize images to [0, 1] if they are not already
             # Assuming original_img_tensor is already normalized or in a compatible range
