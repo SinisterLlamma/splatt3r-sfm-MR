@@ -4,6 +4,7 @@ import argparse
 import torch
 import numpy as np
 import json
+import shutil
 import imageio.v2 as imageio
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
@@ -188,17 +189,7 @@ def main():
                     continue
                 
                 # Save PLY
-                print("  Aggregating Gaussians...")
-                # We need cache_dir and pairs. 
-                # get_reconstructed_scene_splatt3r returns: scene, imgs, pairs, cache_dir
-                # But we didn't capture them.
-                # We need to update the call above.
-                
-                # Re-run reconstruction call to capture returns? No, that's expensive.
-                # We should update the call signature in the script above.
-                pass
-                
-                # I will update the call signature in the next chunk.
+
 
                 
                 # Render and Evaluate
@@ -226,6 +217,23 @@ def main():
                     for k, v in m.items():
                         seq_metrics[k].append(v)
                         
+                    # Save Visualization (First 5 views)
+                    if i < 5:
+                        vis_dir = os.path.join(output_dir, 'vis')
+                        os.makedirs(vis_dir, exist_ok=True)
+                        
+                        # Convert back to [0, 1] HWC numpy
+                        render_np = render.permute(1, 2, 0).cpu().clamp(0, 1).numpy()
+                        gt_np = gt_img.permute(1, 2, 0).cpu().clamp(0, 1).numpy()
+                        
+                        # Concatenate side-by-side
+                        combined = np.concatenate([gt_np, render_np], axis=1)
+                        
+                        # Save
+                        vis_path = os.path.join(vis_dir, f'view_{i:03d}.png')
+                        imageio.imwrite(vis_path, (combined * 255).astype(np.uint8))
+
+                        
                 # Average metrics
                 avg_metrics = {k: np.mean(v) for k, v in seq_metrics.items()}
                 print(f"  Results (w={weight}): {avg_metrics}")
@@ -236,6 +244,11 @@ def main():
                 
                 with open(os.path.join(args.output_root, 'results.json'), 'w') as f:
                     json.dump(results, f, indent=2)
+                    
+                # Cleanup Cache
+                if os.path.exists(cache_dir):
+                    print(f"  Cleaning up cache: {cache_dir}")
+                    shutil.rmtree(cache_dir)
 
 if __name__ == '__main__':
     main()

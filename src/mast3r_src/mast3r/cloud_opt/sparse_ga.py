@@ -607,9 +607,33 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                     # Filter out None entries from gauss_attrs before passing to loss_photometric
                     valid_gauss_attrs = [g for g in gauss_attrs if g is not None]
                     if valid_gauss_attrs:
-                        loss += photometric_loss_w * loss_photometric(K, w2cam, pts3d, gauss_attrs, pix_loss)
+                        p_loss = loss_photometric(K, w2cam, pts3d, gauss_attrs, pix_loss)
+                        loss += photometric_loss_w * p_loss
+                        if iter % 50 == 0:
+                             print(f"Iter {iter}: Photometric Loss = {p_loss.item()}, Weight = {photometric_loss_w}")
 
                 loss.backward()
+                
+                # DEBUG: Check gradients
+                if iter % 50 == 0 and photometric_loss_w > 0:
+                     print(f"  Debug Gradients (Iter {iter}):")
+                     # Check geometry gradients
+                     if core_depth[0].grad is not None:
+                         print(f"    core_depth[0] grad norm: {core_depth[0].grad.norm().item():.6f}")
+                     else:
+                         print("    core_depth[0] grad is None!")
+                         
+                     # Check attribute gradients
+                     for i, g_attr in enumerate(gauss_attrs):
+                         if g_attr:
+                             print(f"    Img {i} Attributes:")
+                             for k, v in g_attr.items():
+                                 if v.grad is not None:
+                                     print(f"      {k} grad norm: {v.grad.norm().item():.6f}")
+                                 else:
+                                     print(f"      {k} grad is None!")
+                             break # Just check first valid image
+
                 optimizer.step()
 
                 # make sure the pose remains well optimizable
