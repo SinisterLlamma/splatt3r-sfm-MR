@@ -148,9 +148,9 @@ def get_reconstructed_scene_splatt3r(outdir, model, retrieval_model, device, fil
         else:
             print(">> Running Image Retrieval...")
             try:
-                # FIXED: Pass only the encoder to the retriever
-                backbone = model.encoder if hasattr(model, 'encoder') else model
-                retriever = Retriever(retrieval_model, backbone=backbone, device=device)
+                # FIXED: Let Retriever load its own backbone (MASt3R original)
+                # This ensures we don't use the modified Splatt3R encoder for retrieval
+                retriever = Retriever(retrieval_model, device=device)
                 with torch.no_grad():
                     sim_matrix = retriever(filelist)
                 del retriever
