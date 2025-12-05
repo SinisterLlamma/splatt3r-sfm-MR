@@ -227,6 +227,9 @@ def main(args):
     )
     # Extract & Save Splats
     print(">> Extracting optimized geometry...")
+    aggregate_and_save_ply(scene, imgs, pairs, cache_dir, args.output_dir, device, args.conf_thresh, filelist)
+
+def aggregate_and_save_ply(scene, imgs, pairs, cache_dir, output_dir, device, conf_thresh, filelist):
     poses = scene.get_im_poses()
     optimized_means, _, confidences = scene.get_dense_pts3d()
     
@@ -347,8 +350,8 @@ def main(args):
                 q = roma.rotmat_to_unitquat(cam_rot).unsqueeze(0).repeat(N_points, 1)
 
             # FILTERING
-            if args.conf_thresh > 0:
-                mask = confs > args.conf_thresh
+            if conf_thresh > 0:
+                mask = confs > conf_thresh
                 pts_global = pts_global[mask]
                 opac = opac[mask]
                 scale = scale[mask]
@@ -367,8 +370,8 @@ def main(args):
     final_rot = torch.cat(all_rot).cpu().numpy()
     final_sh = torch.cat(all_sh).cpu().numpy()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    out_path = os.path.join(args.output_dir, 'scene.ply')
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, 'scene.ply')
     save_splat_ply(out_path, final_xyz, final_opac, final_scale, final_rot, final_sh)
     print(f">> Done! Saved to {out_path}")
     print(f"   Total Gaussians: {len(final_xyz)}")
