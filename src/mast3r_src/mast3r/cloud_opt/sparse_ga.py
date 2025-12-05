@@ -28,6 +28,12 @@ from dust3r.optim_factory import adjust_learning_rate_by_lr  # noqa
 from dust3r.cloud_opt.base_opt import clean_pointcloud
 from dust3r.viz import SceneViz
 
+try:
+    from gsplat import rasterization
+except ImportError:
+    print("Warning: Could not import gsplat. Photometric optimization will be disabled.")
+    rasterization = None
+
 
 class SparseGA():
     def __init__(self, img_paths, pairs_in, res_fine, anchors, canonical_paths=None):
@@ -73,7 +79,15 @@ class SparseGA():
         base_focals = []
         anchors = {}
         for i, canon_path in enumerate(self.canonical_paths):
-            (canon, canon2, conf), focal = torch.load(canon_path, map_location=device)
+            loaded = torch.load(canon_path, map_location=device)
+            if len(loaded) == 2:
+                if len(loaded[0]) == 3:
+                    (canon, canon2, conf), focal = loaded
+                else:
+                    (canon, canon2, conf, _), focal = loaded
+            else:
+                 # Fallback or error
+                 raise ValueError(f"Unexpected cache format at {canon_path}")
             confs.append(conf)
             base_focals.append(focal)
 
@@ -144,14 +158,14 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
     # tmp_pairs = {(a,b):v for (a,b),v in tmp_pairs.items() if {(a,b),(b,a)} & min_spanning_tree}
 
     # smartly combine all usefull data
-    imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21 = \
+    imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21, core_attrs = \
         condense_data(imgs, tmp_pairs, canonical_views, preds_21, dtype)
 
-    imgs, res_coarse, res_fine = sparse_scene_optimizer(
+    res = sparse_scene_optimizer(
         imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21, canonical_paths, mst,
-        shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, **kw)
-
-    return SparseGA(imgs, pairs_in, res_fine or res_coarse, anchors, canonical_paths)
+        shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, core_attrs=core_attrs, **kw)
+    
+    return SparseGA(imgs, pairs_in, res, anchors, canonical_paths=canonical_paths)
 
 
 def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d,
@@ -165,6 +179,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                            shared_intrinsics=False,
                            init={}, device='cuda', dtype=torch.float32,
                            matching_conf_thr=5., loss_dust3r_w=0.01,
+                           photometric_loss_w=0.0, core_attrs=None,
                            verbose=True, dbg=()):
 
     # extrinsic parameters
@@ -318,7 +333,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     dust3r_slices = [s for s in imgs_slices if not is_matching_ok[s.img1, s.img2]]
     loss3d_slices = [s for s in imgs_slices if is_matching_ok[s.img1, s.img2]]
     cleaned_corres2d = []
-    for cci, (img1, pix1, confs, confsum, imgs_slices) in enumerate(corres2d):
+    for cci, (img1, pix1, confs, cf_sum, imgs_slices) in enumerate(corres2d):
         cf_sum = 0
         pix1_filtered = []
         confs_filtered = []
@@ -397,9 +412,171 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
         return loss / npix if npix != 0 else 0.
 
+    def loss_photometric(K, w2cam, pts3d, gauss_attrs, pix_loss):
+        if photometric_loss_w == 0.0 or rasterization is None:
+            return 0.0
+
+        total_loss = 0.0
+        num_rendered_pixels = 0
+
+        for i, img_path in enumerate(imgs):
+            if init[img_path].get('freeze', 0) >= 1:
+                continue
+
+            # Load original image for photometric loss
+            if 'img' in init[img_path]:
+                original_img_tensor = init[img_path]['img'].to(device)
+            else:
+                # Load image from path
+                from PIL import Image
+                import torchvision.transforms.functional as TF
+                img_pil = Image.open(img_path).convert('RGB')
+                # Resize to match optimization resolution
+                W_target, H_target = int(imsizes[i][0]), int(imsizes[i][1])
+                img_pil = img_pil.resize((W_target, H_target), Image.LANCZOS)
+                original_img_tensor = TF.to_tensor(img_pil).to(device)
+                # Cache it
+                init[img_path]['img'] = original_img_tensor
+            
+            H, W = original_img_tensor.shape[-2:]
+
+            # Get camera parameters for gsplat
+            # w2cam is World-to-Camera (View Matrix)
+            # gsplat expects (C, 4, 4) viewmats and (C, 3, 3) Ks
+            view_matrix = w2cam[i].unsqueeze(0).contiguous().float() # (1, 4, 4)
+            projection_matrix = K[i].unsqueeze(0).contiguous().float() # (1, 3, 3)
+            
+            # Ensure 3 dimensions
+            if view_matrix.ndim == 2:
+                view_matrix = view_matrix.unsqueeze(0)
+            if projection_matrix.ndim == 2:
+                projection_matrix = projection_matrix.unsqueeze(0)
+            
+            camera_center = w2cam[i][:3, 3].contiguous()
+
+            # Prepare Gaussian attributes for rendering
+            # means come from the optimized pts3d
+            # pts3d[i] corresponds to anchors[i]
+            # We need to map core_attrs to these points if they are not already mapped
+            # But wait, pts3d is already dense (or sparse anchors).
+            # In optimize_loop, pts3d is constructed from anchors.
+            # So pts3d[i] has the same number of points as anchors[i].
+            # core_attrs[i] (if we used it to init params) should also match.
+            
+            # However, if we are optimizing attributes, gauss_attrs[i] contains the parameters.
+            # These parameters should match the shape of pts3d[i].
+            
+            means = pts3d[i].contiguous().float()
+            scales = gauss_attrs[i]['scales'].contiguous().float()
+            quats = gauss_attrs[i]['rotations'].contiguous().float()
+            opacities = gauss_attrs[i]['opacities'].contiguous().float()
+            sh = gauss_attrs[i]['sh'].contiguous().float()
+            
+            # Normalize quaternions
+            quats = F.normalize(quats, p=2, dim=-1)
+            
+            # Convert xyzw (roma/Splatt3R) to wxyz (gsplat)
+            # quats is (N, 4) -> (x, y, z, w)
+            # we want (w, x, y, z)
+            quats = torch.cat([quats[:, 3:4], quats[:, 0:3]], dim=-1)
+
+            # Handle SH
+            # gsplat expects colors as (N, K, 3) if sh_degree is not None
+            # K = (degree + 1) ** 2
+            sh_degree = 0
+            if sh.ndim == 2:
+                if sh.shape[-1] == 3:
+                    # (N, 3) -> (N, 1, 3) -> Degree 0
+                    sh = sh.unsqueeze(1)
+                    sh_degree = 0
+                elif sh.shape[-1] == 12:
+                    # (N, 12) -> (N, 4, 3) -> Degree 1
+                    sh = sh.reshape(-1, 4, 3)
+                    sh_degree = 1
+                # Add more cases if needed
+            elif sh.ndim == 3:
+                # (N, K, 3)
+                K_dim = sh.shape[1]
+                if K_dim == 1:
+                    sh_degree = 0
+                elif K_dim == 4:
+                    sh_degree = 1
+                elif K_dim == 9:
+                    sh_degree = 2
+                elif K_dim == 16:
+                    sh_degree = 3
+
+            # Render the image
+            rendered_image, _, _ = rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=sh,
+                viewmats=view_matrix,
+                Ks=projection_matrix,
+                width=W,
+                height=H,
+                sh_degree=sh_degree,
+                packed=True
+            )
+
+            # Compute photometric loss (e.g., L1 loss)
+            # Assuming original_img_tensor is [1, 3, H, W] and rendered_image is [H, W, 3]
+            # Convert rendered_image to [1, 3, H, W]
+            rendered_image = rendered_image.permute(2, 0, 1).unsqueeze(0)
+            
+            # Normalize images to [0, 1] if they are not already
+            # Assuming original_img_tensor is already normalized or in a compatible range
+            # If original_img_tensor is [-1, 1], convert to [0, 1]
+            if original_img_tensor.min() < 0:
+                original_img_tensor = (original_img_tensor + 1) / 2
+            
+            # If rendered_image is not in [0, 1], clip it
+            rendered_image = rendered_image.clamp(0, 1)
+
+            current_loss = F.l1_loss(rendered_image, original_img_tensor, reduction='sum')
+            total_loss += current_loss
+            num_rendered_pixels += H * W
+
+        return total_loss / num_rendered_pixels if num_rendered_pixels > 0 else 0.0
+
+
     def optimize_loop(loss_func, lr_base, niter, pix_loss, lr_end=0):
         # create optimizer
         params = pps + log_focals + quats + trans + log_sizes + core_depth
+        
+        # Add Gaussian attributes to parameters if photometric loss is enabled
+        gauss_attrs = [None] * len(imgs)
+        if photometric_loss_w > 0 and rasterization is not None and core_attrs is not None:
+            for i, img_path in enumerate(imgs):
+                # core_attrs[i] contains attributes for image i
+                if core_attrs[i] is not None:
+                    # anchors[i] = (pixels, idxs, offsets)
+                    # core_attrs[i] values are full maps (subsampled).
+                    # We need to extract the values corresponding to the anchors.
+                    # idxs are the indices into the flattened core_depth/attrs.
+                    
+                    _, idxs, _ = anchors[i]
+                    
+                    current_gauss_attrs = {}
+                    # Keys: scales, rotations, opacities, sh
+                    for k, v in core_attrs[i].items():
+                        # v is (H, W, D) or (H, W). Flatten and index.
+                        if v.ndim == 3:
+                            val = v.reshape(-1, v.shape[-1])[idxs]
+                        else:
+                            val = v.reshape(-1, 1)[idxs]
+                        
+                        # Create parameter
+                        current_gauss_attrs[k] = nn.Parameter(val.to(dtype).to(device))
+                    
+                    gauss_attrs[i] = current_gauss_attrs
+                    params.extend(current_gauss_attrs.values())
+                else:
+                    if photometric_loss_w > 0:
+                        print(f"Warning: No Gaussian attributes found for image {img_path}. Photometric loss for this image will be skipped.")
+
         optimizer = torch.optim.Adam(params, lr=1, weight_decay=0, betas=(0.9, 0.9))
         ploss = pix_loss if 'meta' in repr(pix_loss) else (lambda a: pix_loss)
 
@@ -415,7 +592,16 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 adjust_learning_rate_by_lr(optimizer, lr)
                 pix_loss = ploss(1 - alpha)
                 optimizer.zero_grad()
-                loss = loss_func(K, w2cam, pts3d, pix_loss) + loss_dust3r_w * loss_dust3r(cam2w, pts3d, lossd)
+                
+                loss = loss_func(K, w2cam, pts3d, pix_loss)
+                loss += loss_dust3r_w * loss_dust3r(cam2w, pts3d, lossd)
+                
+                if photometric_loss_w > 0 and rasterization is not None:
+                    # Filter out None entries from gauss_attrs before passing to loss_photometric
+                    valid_gauss_attrs = [g for g in gauss_attrs if g is not None]
+                    if valid_gauss_attrs:
+                        loss += photometric_loss_w * loss_photometric(K, w2cam, pts3d, gauss_attrs, pix_loss)
+
                 loss.backward()
                 optimizer.step()
 
@@ -465,7 +651,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     else:
         print('Final focals =', to_numpy(K[:, 0, 0]))
 
-    return imgs, res_coarse, res_fine
+    return res_fine or res_coarse
 
 
 @lru_cache
@@ -594,6 +780,8 @@ def extract_gaussian_attributes(result_dict):
     gauss_attrs = {}
     
     # Extract Gaussian-specific attributes from Splatt3R predictions
+    if 'means' in result_dict:
+        gauss_attrs['means'] = result_dict['means'][0]
     if 'scales' in result_dict:
         gauss_attrs['scales'] = result_dict['scales'][0]
     if 'rotations' in result_dict:
@@ -668,7 +856,7 @@ def extract_correspondences(feats, qonfs, subsample=8, device=None, ptmap_key='p
     feat11, feat21, feat22, feat12 = feats
     qonf11, qonf21, qonf22, qonf12 = qonfs
 
-    assert feat11.shape[:2] == feat12.shape[:2] == qonf11.shape == qonf12.shape, (feat11.shape, feat12.shape, qonf11.shape, qonf12.shape)
+    assert feat11.shape[:2] == feat11.shape[:2] == qonf11.shape == qonf12.shape, (feat11.shape, feat12.shape, qonf11.shape, qonf12.shape)
     assert feat21.shape[:2] == feat22.shape[:2] == qonf21.shape == qonf22.shape, (feat21.shape, feat22.shape, qonf21.shape, qonf22.shape)
 
     if '3d' in ptmap_key:
@@ -713,22 +901,30 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
 
     for img in tqdm(imgs):
         if cache_path:
-            cache = os.path.join(cache_path, 'canon_views', hash_md5(img) + f'_{subsample=}_{kw=}.pth')
+            cache = os.path.join(cache_path, 'canon_views', hash_md5(img) + f'_{subsample=}_{kw=}_v2.pth')
             canonical_paths.append(cache)
         try:
-            (canon, canon2, cconf), focal = torch.load(cache, map_location=device)
-        except IOError:
-            # cache does not exist yet, we create it!
+            loaded = torch.load(cache, map_location=device)
+            if len(loaded) == 2:
+                (canon, canon2, cconf), focal = loaded
+                canon_attrs = None
+            else:
+                (canon, canon2, cconf, canon_attrs), focal = loaded
+        except (IOError, ValueError):
+            # cache does not exist yet or is invalid, we create it!
             canon = focal = None
 
         # collect all pred1
         n_pairs = sum((img in pair) for pair in tmp_pairs)
 
         ptmaps11 = None
+        confs11 = None
+        attrs11 = [] # List to store attributes for each pair
         pixels = {}
         n = 0
         for (img1, img2), ((path1, path2), path_corres) in tmp_pairs.items():
             score = None
+            gauss_path = None
             if img == img1:
                 X, C, X2, C2 = torch.load(path1, map_location=device)
                 score, (xy1, xy2, confs) = load_corres(path_corres, device, min_conf_thr)
@@ -737,6 +933,12 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
                     preds_21[img] = {}
                 # Subsample preds_21
                 preds_21[img][img2] = X2[::subsample, ::subsample].reshape(-1, 3), C2[::subsample, ::subsample].ravel()
+                
+                # Load Gaussian attributes
+                idx1_hash = hash_md5(img1)
+                idx2_hash = hash_md5(img2)
+                gauss_path = os.path.join(cache_path, 'forward', idx1_hash, f'{idx2_hash}_gauss.pth')
+                is_img1 = True
 
             if img == img2:
                 X, C, X2, C2 = torch.load(path2, map_location=device)
@@ -745,6 +947,12 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
                 if img not in preds_21:
                     preds_21[img] = {}
                 preds_21[img][img1] = X2[::subsample, ::subsample].reshape(-1, 3), C2[::subsample, ::subsample].ravel()
+                
+                # Load Gaussian attributes
+                idx1_hash = hash_md5(img1)
+                idx2_hash = hash_md5(img2)
+                gauss_path = os.path.join(cache_path, 'forward', idx2_hash, f'{idx1_hash}_gauss.pth')
+                is_img1 = False
 
             if score is not None:
                 i, j = imgs.index(img1), imgs.index(img2)
@@ -763,12 +971,30 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
 
                 ptmaps11[n] = X
                 confs11[n] = C
+                
+                # Load and store attributes
+                if gauss_path and os.path.isfile(gauss_path):
+                    try:
+                        g_attrs_pair = torch.load(gauss_path, map_location=device)
+                        # g_attrs_pair is (attrs1, attrs2)
+                        if is_img1:
+                            attrs = g_attrs_pair[0]
+                        else:
+                            attrs = g_attrs_pair[1]
+                        attrs11.append(attrs)
+                    except Exception as e:
+                        print(f"Failed to load attributes from {gauss_path}: {e}")
+                        attrs11.append(None)
+                else:
+                    attrs11.append(None)
+                
                 n += 1
 
         if canon is None:
-            canon, canon2, cconf = canonical_view(ptmaps11, confs11, subsample, **kw)
+            canon, canon2, cconf, canon_attrs = canonical_view(ptmaps11, confs11, subsample, attrs11, **kw)
             del ptmaps11
             del confs11
+            del attrs11
 
         # compute focals
         H, W = canon.shape[:2]
@@ -776,13 +1002,32 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
         if focal is None:
             focal = estimate_focal_knowing_depth(canon[None], pp, focal_mode='weiszfeld', min_focal=0.5, max_focal=3.5)
             if cache:
-                torch.save(to_cpu(((canon, canon2, cconf), focal)), mkdir_for(cache))
+                torch.save(to_cpu(((canon, canon2, cconf, canon_attrs), focal)), mkdir_for(cache))
 
         # extract depth offsets with correspondences
         core_depth = canon[subsample // 2::subsample, subsample // 2::subsample, 2]
         idxs, offsets = anchor_depth_offsets(canon2, pixels, subsample=subsample)
+        
+        # Store canon_attrs in canonical_views
+        # We need to subsample canon_attrs to match core_depth (anchors)
+        # canon_attrs are full resolution (H, W).
+        # We'll store the full map or subsampled?
+        # condense_data expects to extract values for anchors.
+        # Let's store the full map in canonical_views for now, or subsampled.
+        # core_depth is subsampled.
+        # Let's store subsampled attributes in canonical_views to save memory and match structure.
+        
+        core_attrs = {}
+        if canon_attrs:
+            for k, v in canon_attrs.items():
+                # v is (H, W, D) or (H, W)
+                # Subsample: v[subsample//2::subsample, subsample//2::subsample]
+                if v.ndim == 3:
+                    core_attrs[k] = v[subsample // 2::subsample, subsample // 2::subsample]
+                else:
+                    core_attrs[k] = v[subsample // 2::subsample, subsample // 2::subsample]
 
-        canonical_views[img] = (pp, (H, W), focal.view(1), core_depth, pixels, idxs, offsets)
+        canonical_views[img] = (pp, (H, W), focal.view(1), core_depth, pixels, idxs, offsets, core_attrs)
 
     return tmp_pairs, pairwise_scores, canonical_views, canonical_paths, preds_21
 
@@ -807,17 +1052,19 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
     shapes = []
     focals = []
     core_depth = []
+    core_attrs = [] # List of dicts
     img_anchors = {}
     tmp_pixels = {}
 
     for idx1, img1 in enumerate(imgs):
         # load stuff
-        pp, shape, focal, anchors, pixels_confs, idxs, offsets = canonical_views[img1]
+        pp, shape, focal, anchors, pixels_confs, idxs, offsets, c_attrs = canonical_views[img1]
 
         principal_points.append(pp)
         shapes.append(shape)
         focals.append(focal)
         core_depth.append(anchors)
+        core_attrs.append(c_attrs)
 
         img_uv1 = []
         img_idxs = []
@@ -884,10 +1131,10 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
             idxs = img_anchors[imgs.index(im2k)][1]
             subsamp_preds_21[imk][im2k] = (pred[idxs], conf[idxs])  # anchors subsample
 
-    return imsizes, principal_points, focals, core_depth, img_anchors, corres, corres2d, subsamp_preds_21
+    return imsizes, principal_points, focals, core_depth, img_anchors, corres, corres2d, subsamp_preds_21, core_attrs
 
 
-def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
+def canonical_view(ptmaps11, confs11, subsample, attrs11=None, mode='avg-angle'):
     assert len(ptmaps11) == len(confs11) > 0, 'not a single view1 for img={i}'
 
     # canonical pointmap is just a weighted average
@@ -924,7 +1171,41 @@ def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
         raise ValueError(f'bad {mode=}')
 
     confs = (confs11.square().sum(dim=0) / confs11.sum(dim=0)).squeeze()
-    return canon, canon2, confs
+    
+    # Aggregate attributes
+    canon_attrs = {}
+    if attrs11 and any(a is not None for a in attrs11):
+        # attrs11 is a list of dicts. We need to stack them.
+        # Keys: scales, rotations, opacities, sh
+        keys = attrs11[0].keys() if attrs11[0] else []
+        for k in keys:
+            vals = []
+            w_list = []
+            for i, attr in enumerate(attrs11):
+                if attr and k in attr:
+                    vals.append(attr[k])
+                    w_list.append(confs11[i])
+            
+            if vals:
+                vals = torch.stack(vals) # (M, H, W, D)
+                w = torch.stack(w_list) # (M, H, W)
+                
+                # Reshape w to match vals
+                while w.ndim < vals.ndim:
+                    w = w.unsqueeze(-1)
+                
+                w_sum = w.sum(dim=0) + 1e-8
+                
+                if k == 'rotations':
+                    # Weighted average of quaternions (approx)
+                    avg = (vals * w).sum(dim=0) / w_sum
+                    avg = avg / (avg.norm(dim=-1, keepdim=True) + 1e-8)
+                    canon_attrs[k] = avg
+                else:
+                    avg = (vals * w).sum(dim=0) / w_sum
+                    canon_attrs[k] = avg
+
+    return canon, canon2, confs, canon_attrs
 
 
 def anchor_depth_offsets(canon_depth, pixels, subsample=8):

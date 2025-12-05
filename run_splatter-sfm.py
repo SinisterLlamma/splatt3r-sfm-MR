@@ -116,7 +116,7 @@ def load_gaussian_attributes(cache_path, img1_instance, img2_instance, is_img1=T
 def get_reconstructed_scene_splatt3r(outdir, model, retrieval_model, device, filelist, 
                                      scenegraph_type='complete', winsize=20, refid=10,
                                      lr1=0.07, niter1=500, lr2=0.01, niter2=300, 
-                                     matching_conf_thr=5.0):
+                                     matching_conf_thr=5.0, photometric_loss_w=0.5):
     """
     Custom version of get_reconstructed_scene specifically for Splatt3R CLI usage.
     """
@@ -181,7 +181,8 @@ def get_reconstructed_scene_splatt3r(outdir, model, retrieval_model, device, fil
                                     lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, 
                                     device=device,
                                     opt_depth=True, 
-                                    matching_conf_thr=matching_conf_thr)
+                                    matching_conf_thr=matching_conf_thr,
+                                    photometric_loss_w=photometric_loss_w)
     
     return scene, imgs, pairs, cache_dir
 
@@ -218,12 +219,12 @@ def main(args):
 
     # Run Reconstruction
     scene, imgs, pairs, cache_dir = get_reconstructed_scene_splatt3r(
-        args.output_dir, model, args.retrieval_ckpt, device, filelist,
+        args.output_dir, model, args.retrieval_ckpt, device, filelist, 
         scenegraph_type=args.scenegraph_type,
-        winsize=args.winsize,
-        refid=args.refid
+        winsize=args.winsize, refid=args.refid,
+        matching_conf_thr=5.0,
+        photometric_loss_w=args.photometric_loss_w
     )
-
     # Extract & Save Splats
     print(">> Extracting optimized geometry...")
     poses = scene.get_im_poses()
@@ -385,6 +386,7 @@ if __name__ == '__main__':
     parser.add_argument('--winsize', type=int, default=20, help='Retrieval: Num key images')
     parser.add_argument('--refid', type=int, default=10, help='Retrieval: Num neighbors')
     parser.add_argument('--conf_thresh', type=float, default=0.0, help='Confidence threshold for filtering points')
+    parser.add_argument('--photometric_loss_w', type=float, default=0.5, help='Weight for photometric loss (0 to disable)')
     
     args = parser.parse_args()
     main(args)
